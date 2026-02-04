@@ -1,0 +1,268 @@
+const API_URL = "https://data.vatsim.net/v3/vatsim-data.json";
+
+/* ---------------- MODES ---------------- */
+const MODES = {
+  normal: ["planned-dep", "cleared", "push", "taxi", "arr-seq", "airborne"],
+  procedural: ["planned-dep", "cleared", "taxi", "arr-seq", "contact", "released", "holding", "approach"],
+  oceanic: ["planned", "cruise", "exit"]
+};
+
+/* ---------------- STATE ---------------- */
+const state = {
+  icao: "EGLL",
+  mode: localStorage.getItem("mode_vstrips") || "normal",
+  positions: JSON.parse(localStorage.getItem("positions_vstrips") || "{}"),
+  orders: JSON.parse(localStorage.getItem("orders_vstrips") || "{}"),
+  flights: {}
+};
+
+function getCols() {
+  return MODES[state.mode];
+}
+
+/* ---------------- REGISTRATION ---------------- */
+function extractRegistration(remarks = "") {
+  const m = remarks.match(/REG\/([A-Z0-9-]+)/i);
+  return m ? m[1].toUpperCase() : "";
+}
+
+/* ---------------- NORMAL / PROCEDURAL STRIP ---------------- */
+function buildStrip(f) {
+  const div = document.createElement("div");
+  div.className = "strip transition";
+  div.draggable = true;
+  div.dataset.callsign = f.callsign;
+
+  div.style.backgroundColor = f.type === "arr" ? "#d4f7d4" : "#d4e7f7";
+
+  const r1 = document.createElement("div");
+  r1.className = "row";
+  r1.innerHTML = `
+    <div class="cell header">${f.callsign}</div>
+    <div class="cell">${f.aircraft || ""}</div>
+    <div class="cell">${f.cruise?.slice(0,3) || ""}</div>
+    <div class="cell">${f.flight_rule || ""}</div>
+    <div class="cell">${f.squawk || ""}</div>
+  `;
+
+  const r2 = document.createElement("div");
+  r2.className = "row";
+  r2.innerHTML = `
+    <div class="cell">${f.dep || ""}</div>
+    <div class="cell">${f.arr || ""}</div>
+  `;
+
+  div.append(r1, r2);
+  enableDrag(div);
+  return div;
+}
+
+/* ---------------- OCEANIC STRIP (UNCHANGED UI) ---------------- */
+function buildOceanicStrip(f) {
+  const div = document.createElement("div");
+  div.className = "strip oceanic";
+  div.draggable = true;
+  div.dataset.callsign = f.callsign;
+
+  div.style.background = "#f3f6ff";
+  div.style.border = "1px solid #2563eb";
+  div.style.borderRadius = "8px";
+  div.style.padding = "4px";
+  div.style.fontFamily = "monospace";
+
+  const table = document.createElement("table");
+  table.style.width = "100%";
+  table.style.borderCollapse = "collapse";
+  table.style.tableLayout = "fixed";
+  table.style.fontSize = "12px";
+
+  table.innerHTML = `
+    <tr>
+      <td>${f.aircraft || ""}</td>
+      <td>1</td>
+      <td>${f.dep || "----"}</td>
+      <td>WPT1</td>
+      <td>WPT2</td>
+      <td>WPT3</td>
+      <td>WPT4</td>
+    </tr>
+
+    <tr>
+      <td colspan="2" style="background:#fde047;font-weight:bold">
+        ${f.callsign}
+      </td>
+      <td>${f.squawk || "----"}</td>
+      <td>EST</td>
+      <td>EST</td>
+      <td>EST</td>
+      <td>EST</td>
+    </tr>
+
+    <tr>
+      <td>${f.cruise ? f.cruise.toString().slice(0,3) : "----"}</td>
+      <td>${f.registration || "----"}</td>
+      <td>${f.arr || "----"}</td>
+
+      <td><input class="act-box" /></td>
+      <td><input class="act-box" /></td>
+      <td><input class="act-box" /></td>
+      <td><input class="act-box" /></td>
+    </tr>
+  `;
+
+  [...table.querySelectorAll("td")].forEach(td => {
+    td.style.border = "1px solid #2563eb";
+    td.style.padding = "2px";
+    td.style.textAlign = "center";
+    td.style.verticalAlign = "middle";
+    td.style.whiteSpace = "nowrap";
+  });
+
+  [...table.querySelectorAll(".act-box")].forEach(input => {
+    input.style.width = "100%";
+    input.style.border = "none";
+    input.style.outline = "none";
+    input.style.textAlign = "center";
+    input.style.fontFamily = "monospace";
+    input.style.fontSize = "12px";
+    input.style.background = "transparent";
+  });
+
+  div.appendChild(table);
+  enableDrag(div, f.callsign);
+  return div;
+}
+
+
+/* ---------------- DRAG ---------------- */
+function enableDrag(strip) {
+  strip.addEventListener("dragstart", e => {
+    strip.classList.add("dragging");
+    e.dataTransfer.setData("text/plain", strip.dataset.callsign);
+  });
+
+  strip.addEventListener("dragend", () => {
+    strip.classList.remove("dragging");
+    saveOrders();
+  });
+}
+
+function getAfterElement(container, y) {
+  const els = [...container.querySelectorAll(".strip:not(.dragging)")];
+  return els.reduce((closest, child) => {
+    const box = child.getBoundingClientRect();
+    const offset = y - box.top - box.height / 2;
+    if (offset < 0 && offset > closest.offset) {
+      return { offset, element: child };
+    }
+    return closest;
+  }, { offset: -Infinity }).element;
+}
+
+/* ---------------- LOAD FLIGHTS ---------------- */
+async function loadAirport(icao) {
+  state.icao = icao;
+  const data = await (await fetch(API_URL)).json();
+
+  state.flights = {};
+
+  data.pilots.forEach(p => {
+    if (!p.flight_plan) return;
+
+    const dep = p.flight_plan.departure;
+    const arr = p.flight_plan.arrival;
+
+    if (state.mode === "oceanic" || dep === icao || arr === icao) {
+      state.flights[p.callsign] = {
+        callsign: p.callsign,
+        dep,
+        arr,
+        aircraft: p.flight_plan.aircraft_short,
+        cruise: p.flight_plan.altitude,
+        flight_rule: p.flight_plan.flight_rules,
+        squawk: p.transponder,
+        registration: extractRegistration(p.flight_plan.remarks),
+        type: dep === icao ? "dep" : "arr"
+      };
+
+      state.positions[p.callsign] ||= getCols()[0];
+    }
+  });
+
+  render();
+}
+
+/* ---------------- SAVE ORDER ---------------- */
+function saveOrders() {
+  const orders = {};
+  getCols().forEach(col => {
+    orders[col] = [...document.getElementById(col)
+      .querySelectorAll(".strip")]
+      .map(s => s.dataset.callsign);
+  });
+
+  state.orders = orders;
+  localStorage.setItem("orders_vstrips", JSON.stringify(orders));
+  localStorage.setItem("positions_vstrips", JSON.stringify(state.positions));
+}
+
+/* ---------------- RENDER ---------------- */
+function render() {
+  const board = document.getElementById("board");
+  board.innerHTML = "";
+
+  getCols().forEach(col => {
+    const lane = document.createElement("div");
+    lane.className = "lane resizable";
+    lane.id = col;
+    lane.innerHTML = `<h2>${col.toUpperCase()}</h2>`;
+    board.appendChild(lane);
+
+    lane.addEventListener("dragover", e => {
+      e.preventDefault();
+      const dragging = document.querySelector(".dragging");
+      const after = getAfterElement(lane, e.clientY);
+      after ? lane.insertBefore(dragging, after) : lane.appendChild(dragging);
+    });
+
+    lane.addEventListener("drop", e => {
+      const cs = e.dataTransfer.getData("text/plain");
+      state.positions[cs] = col;
+      saveOrders();
+    });
+  });
+
+  getCols().forEach(col => {
+    const lane = document.getElementById(col);
+
+    const ordered = (state.orders[col] || [])
+      .map(cs => state.flights[cs])
+      .filter(Boolean);
+
+    const unordered = Object.values(state.flights)
+      .filter(f => state.positions[f.callsign] === col &&
+                   !(state.orders[col] || []).includes(f.callsign));
+
+    [...ordered, ...unordered].forEach(f => {
+      lane.appendChild(
+        state.mode === "oceanic"
+          ? buildOceanicStrip(f)
+          : buildStrip(f)
+      );
+    });
+  });
+}
+
+/* ---------------- INIT ---------------- */
+document.addEventListener("DOMContentLoaded", () => {
+  document.getElementById("loadBtn").onclick = () =>
+    loadAirport(document.getElementById("icaoInput").value.toUpperCase());
+
+  document.getElementById("modeSelect").onchange = e => {
+    state.mode = e.target.value;
+    localStorage.setItem("mode_vstrips", state.mode);
+    loadAirport(state.icao);
+  };
+
+  render();
+});
